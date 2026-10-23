@@ -39,7 +39,7 @@ flowchart LR
     A --> O[Process-local metrics]
     B --> O
 
-    H[/livez + /readyz] --> A
+    H["/livez + /readyz"] --> A
     H --> B
 ```
 
