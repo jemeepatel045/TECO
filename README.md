@@ -331,3 +331,6 @@ The Redis metrics path also uses `KEYS` to count TECO-prefixed sessions, which i
 ## License
 
 See [LICENSE](LICENSE).
+
+<!-- README render refresh -->
+
