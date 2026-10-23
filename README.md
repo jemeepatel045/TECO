@@ -129,3 +129,22 @@ docker compose down
 ```
 
 Both API containers use one shared Redis service. Published ports are restricted to host loopback, and Redis is not exposed to the host. `TECO_BIND_ALL=1` enables container network access without changing the default host-only behavior. Redis persistence is intentionally disabled for this ephemeral demo. The HTTP implementation remains an educational prototype, not a hardened production service.
+
+
+## Observability and benchmarking (Phase 5)
+
+TECO now records process-local request telemetry. The `/metrics` endpoint includes total requests, response-class counters, process uptime, process-average request rate, and a bounded recent latency window with average, P50, P95, and P99 latency.
+
+For controlled client-observed measurements:
+
+```sh
+python3 benchmarks/load_test.py --url http://127.0.0.1:8080 --requests 1000 --concurrency 8 --mode session-read
+```
+
+Compare in-memory and Redis backends with:
+
+```sh
+./benchmarks/run_comparison.sh
+```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for methodology. TECO remains intentionally single-threaded, and results are machine-dependent.

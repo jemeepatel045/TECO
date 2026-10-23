@@ -45,7 +45,13 @@ def main(executable):
         assert call("POST", "/sessions", {"token": "alice", "state": state}) == (
             200, {"token": "alice", "state": state})
         assert call("GET", "/sessions/alice") == (200, {"token": "alice", "state": state})
-        assert call("GET", "/metrics")[1]["resident_sessions"] == 1
+        metrics = call("GET", "/metrics")[1]
+        assert metrics["resident_sessions"] == 1
+        assert metrics["requests_total"] >= 1
+        assert metrics["responses_2xx"] >= 1
+        assert metrics["latency_samples"] >= 1
+        assert set(metrics["latency_ms"]) == {"avg", "p50", "p95", "p99"}
+        assert metrics["latency_ms"]["p95"] >= 0
         assert call("POST", "/sessions", {"token": "invalid/slash", "state": "x"})[0] == 400
         assert call("POST", "/sessions", raw='{bad json}')[0] == 400
         assert call("POST", "/sessions", raw='{"token":"a","token":"b","state":"c"}')[0] == 400
