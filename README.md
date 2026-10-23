@@ -1,19 +1,41 @@
 # TECO: Thread-Less Ephemeral Context Orchestration
 
-TECO is a C++17 **local prototype** of an event-driven, token-keyed, in-memory session state engine. It supports sliding time-to-live (TTL) expiration and exposes the state engine through a small HTTP API.
+TECO is a C++17 backend-systems portfolio project exploring event-driven, token-keyed ephemeral session state. It supports a local in-memory TTL engine and an optional Redis-backed mode that allows multiple TECO server processes to share session state.
+
+## Current architecture
+
+```text
+Client
+  |
+  v
+TECO REST API
+  |
+  +-------------------+
+  |                   |
+In-memory          Redis
+backend            backend
+  |                   |
+per-process        shared session state
+sliding TTL        Redis PX TTL
+```
 
 ## Features
 
-- Token-keyed session state with sliding TTL, refreshed on writes
-- Lazy eviction when expired tokens are read, and periodic sweeps every 64 state events
-- Explicit session deletion and counters for resident entries and TTL evictions
-- Loopback-only, single-threaded C++ HTTP server with JSON string fields
-- Local CMake + CTest checks, Python HTTP integration tests, and GitHub Actions CI
-- Illustrative benchmark against a sequential thread-create/join baseline
+- Token-keyed session state
+- Sliding TTL refreshed on writes
+- In-memory backend with lazy lookup eviction and periodic sweeps
+- Redis backend using Redis TTL (`SET ... PX`)
+- Cross-process session sharing through Redis
+- REST endpoints for create/update, read, delete, health, and metrics
+- CMake build and CTest suite
+- Python HTTP integration tests
+- Redis cross-instance integration test
+- GitHub Actions CI with a Redis service container
+- Illustrative local benchmark against sequential OS thread create/join
 
-## Build on macOS / Linux
+## Build
 
-Requires C++17 compiler, CMake 3.16+, Python 3.8+.
+Requires C++17, CMake 3.16+, and Python 3.8+.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -21,50 +43,73 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-## Run the API
+When Redis is not available, the Redis integration test is skipped. On GitHub Actions, CI launches Redis automatically.
 
-Terminal 1:
+## In-memory server
 
 ```sh
-./build/teco_server --port 8080 --ttl-ms 300000
+./build/teco_server --port 8080 --backend memory --ttl-ms 300000
 ```
 
-Terminal 2:
+## Redis-backed server
+
+Start a local Redis service first:
+
+```sh
+brew services start redis
+redis-cli ping
+```
+
+Then:
+
+```sh
+./build/teco_server \
+  --port 8080 \
+  --backend redis \
+  --redis-host 127.0.0.1 \
+  --redis-port 6379 \
+  --ttl-ms 300000
+```
+
+Start a second instance in another terminal:
+
+```sh
+./build/teco_server \
+  --port 8081 \
+  --backend redis \
+  --redis-host 127.0.0.1 \
+  --redis-port 6379 \
+  --ttl-ms 300000
+```
+
+A session written to port 8080 can then be read from port 8081 because both processes use the same Redis backend.
+
+## API
 
 ```sh
 curl -i http://127.0.0.1:8080/health
+
 curl -i -X POST http://127.0.0.1:8080/sessions \
   -H 'Content-Type: application/json' \
   -d '{"token":"demo_1","state":"ACTIVE"}'
-curl -i http://127.0.0.1:8080/sessions/demo_1
+
+curl -i http://127.0.0.1:8081/sessions/demo_1
+
 curl -i http://127.0.0.1:8080/metrics
-curl -i -X DELETE http://127.0.0.1:8080/sessions/demo_1
+
+curl -i -X DELETE http://127.0.0.1:8081/sessions/demo_1
 ```
 
-The server responds `201` when creating and `200` when updating a session, `200` when retrieving a session, `204` when deleting it, and `404` for a missing or expired session. Use `Ctrl+C` in Terminal 1 to stop.
+## Metrics behavior
 
-### Endpoints
+The in-memory backend reports TECO-observed TTL evictions. Redis performs expiration internally, so `ttl_evictions` is `null` in Redis mode until a future phase adds Redis keyspace-notification telemetry.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check |
-| `POST` | `/sessions` | Create or update a session using `{"token":"abc","state":"ACTIVE"}` |
-| `GET` | `/sessions/{token}` | Get a non-expired session |
-| `DELETE` | `/sessions/{token}` | Delete a session |
-| `GET` | `/metrics` | Report resident entries and TTL evictions |
+The Redis prototype uses `KEYS` to count TECO-prefixed sessions for a small local demonstration. A production implementation should use a scalable metrics strategy instead of `KEYS`.
 
-Valid tokens are 1–64 ASCII alphanumeric characters, hyphens, or underscores. State values are JSON strings up to 4096 bytes. The API accepts only JSON objects with exactly `token` and `state` string properties. `GET` does **not** extend the session TTL; a write refreshes it. `resident_sessions` counts entries currently present in the map, including expired entries pending a sweep.
+## Scope and limitations
 
-## Benchmark
+TECO is currently an educational local prototype, not a production internet-facing service.
 
-```sh
-./build/teco
-```
+The HTTP server is intentionally single-threaded and loopback-only. The included Redis client is a small RESP client created for this project and opens a Redis TCP connection per command. It does not implement authentication, TLS, connection pooling, Redis Cluster, Sentinel, retries, or production-grade observability.
 
-The benchmark compares the single-threaded TECO event loop with repeatedly creating and joining OS threads, **not** with an optimized reusable thread pool. Results do not establish serverless or distributed throughput superiority.
-
-## Scope and security limitations
-
-This is a **local educational prototype**, not an internet-facing service. It binds only to `127.0.0.1`. Its HTTP implementation is intentionally limited to one connection at a time, one small request per connection, `HTTP/1.1`, `Content-Length`, and a restricted subset of JSON, with 3-second connection read/write timeouts. It does not offer authentication, TLS, general-purpose HTTP support, robust UTF-8 validation, rate limiting, shared/distributed state, or persistence. Processes do not share their in-memory maps. Avoid exposing it publicly. HTTP inputs must not be treated as authentication tokens.
-
-Idle sessions are not proactively removed if no requests arrive. They are evicted upon lookup or subsequent write-driven sweeps. The metrics `resident_sessions` value is not a live active-session count.
+The original benchmark compares the TECO event loop against sequential OS thread creation and joining. It is not a reusable thread-pool comparison and does not prove serverless or distributed performance superiority.
