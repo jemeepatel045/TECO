@@ -166,3 +166,18 @@ curl -i http://127.0.0.1:8090/readyz
 ```
 
 This remains a local demonstration server, not an internet-facing production HTTP implementation.
+
+
+## Resilience testing (Phase 7)
+
+TECO includes an end-to-end Docker failure/recovery test:
+
+```sh
+python3 tests/test_docker_resilience.py
+```
+
+The test verifies cross-instance Redis state, Redis outage behavior, `/livez` versus `/readyz`, HTTP 503 backend-failure handling, recovery after Redis restart, and clean SIGTERM shutdown. GitHub Actions runs the same scenario in a dedicated `docker-resilience` job.
+
+The Docker image health check now targets `/readyz`, so container health reflects backend readiness rather than only HTTP-process liveness.
+
+See [RESILIENCE.md](RESILIENCE.md) for the exact validation sequence and scope.
