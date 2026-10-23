@@ -31,7 +31,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-docker-resilience:
+  docker-resilience:
     runs-on: ubuntu-latest
 
     steps:
