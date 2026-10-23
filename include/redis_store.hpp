@@ -197,6 +197,15 @@ public:
             throw std::runtime_error("Redis PING failed");
     }
 
+    bool ping() const {
+        try {
+            const auto pong = redis_.command({"PING"});
+            return pong.type == teco_redis_detail::RespValue::Type::Simple && pong.text == "PONG";
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
     bool exists(const std::string& token) override {
         const auto r = redis_.command({"EXISTS", key(token)});
         return r.type == teco_redis_detail::RespValue::Type::Integer && r.integer > 0;

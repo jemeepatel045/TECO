@@ -148,3 +148,21 @@ Compare in-memory and Redis backends with:
 ```
 
 See [BENCHMARKS.md](BENCHMARKS.md) for methodology. TECO remains intentionally single-threaded, and results are machine-dependent.
+
+
+## Reliability (Phase 6)
+
+- `GET /livez` checks whether the HTTP process can respond (no Redis dependency).
+- `GET /readyz` checks Redis `PING` when using the Redis backend and returns HTTP 503 if Redis is unavailable.
+- `SIGTERM` and `SIGINT` request graceful shutdown after the current request; idle accept polling is at most about one second.
+- Optional JSON request logs: `TECO_LOG_JSON=1` (avoid logging request bodies or tokens in sensitive deployments; URLs are logged).
+- Environment defaults: `TECO_PORT`, `TECO_TTL_MS`, `TECO_BACKEND`, `TECO_REDIS_HOST`, `TECO_REDIS_PORT`, `TECO_REDIS_PREFIX`. Explicit command-line flags override environment values.
+
+Example:
+
+```sh
+TECO_PORT=8090 TECO_BACKEND=memory TECO_LOG_JSON=1 ./build/teco_server
+curl -i http://127.0.0.1:8090/readyz
+```
+
+This remains a local demonstration server, not an internet-facing production HTTP implementation.
