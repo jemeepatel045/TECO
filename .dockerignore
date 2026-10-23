@@ -1,0 +1,8 @@
+.git
+.github
+build
+.vscode
+.DS_Store
+*.rdb
+*.zip
+__pycache__

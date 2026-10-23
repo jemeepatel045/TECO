@@ -113,3 +113,19 @@ TECO is currently an educational local prototype, not a production internet-faci
 The HTTP server is intentionally single-threaded and loopback-only. The included Redis client is a small RESP client created for this project and opens a Redis TCP connection per command. It does not implement authentication, TLS, connection pooling, Redis Cluster, Sentinel, retries, or production-grade observability.
 
 The original benchmark compares the TECO event loop against sequential OS thread creation and joining. It is not a reusable thread-pool comparison and does not prove serverless or distributed performance superiority.
+
+## Docker Compose demo (Phase 4)
+
+Requires Docker Desktop with Docker Compose.
+
+```sh
+docker compose up --build -d
+docker compose ps
+curl -fsS http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:8081/health
+curl -i -X POST http://127.0.0.1:8080/sessions -H 'Content-Type: application/json' -d '{"token":"docker_demo","state":"FROM_A"}'
+curl -i http://127.0.0.1:8081/sessions/docker_demo
+docker compose down
+```
+
+Both API containers use one shared Redis service. Published ports are restricted to host loopback, and Redis is not exposed to the host. `TECO_BIND_ALL=1` enables container network access without changing the default host-only behavior. Redis persistence is intentionally disabled for this ephemeral demo. The HTTP implementation remains an educational prototype, not a hardened production service.

@@ -389,7 +389,12 @@ int main(int argc, char** argv) {
 
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        // Bind to all container interfaces only when explicitly requested.
+        // Docker Compose publishes the ports on the host loopback interface.
+        const char* bind_all = std::getenv("TECO_BIND_ALL");
+        addr.sin_addr.s_addr = htonl(
+            bind_all != nullptr && std::string(bind_all) == "1"
+                ? INADDR_ANY : INADDR_LOOPBACK);
         addr.sin_port = htons(static_cast<uint16_t>(port));
 
         if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
