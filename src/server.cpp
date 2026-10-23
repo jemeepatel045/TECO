@@ -1,6 +1,9 @@
 // TECO local HTTP demo. Single-threaded, loopback-only, one request per connection.
+// Supports either the original in-memory session backend or a Redis-backed shared backend.
 // POSIX sockets: builds on macOS and Linux. NOT an internet-facing production server.
-#include "teco_engine.hpp"
+#include "redis_store.hpp"
+#include "session_store.hpp"
+
 #include <arpa/inet.h>
 #include <algorithm>
 #include <cstdint>
@@ -11,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <netinet/in.h>
 #include <stdexcept>
 #include <string>
@@ -21,7 +25,6 @@
 namespace {
 constexpr std::size_t MAX_REQUEST = 16384;
 
-// JSON encoding for user-supplied strings.
 std::string escape_json(const std::string& s) {
     std::string out = "\"";
     constexpr char digits[] = "0123456789abcdef";
@@ -43,8 +46,6 @@ std::string escape_json(const std::string& s) {
     return out + '"';
 }
 
-// Minimal, deliberately restricted parser: accepts an object with JSON string values.
-// No third-party dependencies. Does not implement the full JSON specification.
 class JsonStringObjectParser {
     const std::string& s;
     std::size_t i = 0;
@@ -148,8 +149,6 @@ bool valid_token(const std::string& token) {
 
 struct Request { std::string method, path, body; };
 
-// Read a small non-chunked HTTP/1.1 request. Socket timeout ensures no infinite wait.
-// This parser is for localhost demonstration only.
 bool read_request(int fd, Request& req, int& error_status) {
     std::string data;
     char buf[4096];
@@ -172,6 +171,7 @@ bool read_request(int fd, Request& req, int& error_status) {
     req.method = line.substr(0, first);
     req.path = line.substr(first + 1, second - first - 1);
     if (req.path.empty() || req.path[0] != '/') { error_status = 400; return false; }
+
     std::size_t content_length = 0;
     bool has_length = false;
     std::string content_type;
@@ -200,8 +200,10 @@ bool read_request(int fd, Request& req, int& error_status) {
         } else if (name == "content-type") content_type = value;
         pos = next + 2;
     }
+
     if (req.method == "POST" && !has_length) { error_status = 411; return false; }
     if (req.method == "POST" && content_type.find("application/json") != 0) { error_status = 415; return false; }
+
     std::size_t body_start = header_end + 4;
     if (body_start + content_length > MAX_REQUEST) { error_status = 413; return false; }
     while (data.size() - body_start < content_length) {
@@ -226,6 +228,7 @@ std::string message_for(int status) {
         case 415: return "Unsupported Media Type";
         case 431: return "Request Header Fields Too Large";
         case 501: return "Not Implemented";
+        case 503: return "Service Unavailable";
         default: return "Internal Server Error";
     }
 }
@@ -245,49 +248,79 @@ void respond(int fd, int status, std::string body = "{}") {
     }
 }
 
-void dispatch(int fd, TECOCloudEngine& engine, const Request& req) {
-    if (req.path == "/health" && req.method == "GET") {
-        respond(fd, 200, R"({"status":"ok","service":"TECO"})");
-        return;
-    }
-    if (req.path == "/metrics" && req.method == "GET") {
-        respond(fd, 200, "{\"resident_sessions\":" + std::to_string(engine.resident_session_count()) +
-                         ",\"ttl_evictions\":" + std::to_string(engine.eviction_count()) + "}");
-        return;
-    }
-    if (req.path == "/sessions" && req.method == "POST") {
-        try {
-            auto fields = JsonStringObjectParser(req.body).parse();
+void dispatch(int fd, SessionStore& store, const Request& req) {
+    try {
+        if (req.path == "/health" && req.method == "GET") {
+            respond(fd, 200, R"({"status":"ok","service":"TECO"})");
+            return;
+        }
+
+        if (req.path == "/metrics" && req.method == "GET") {
+            std::string evictions = "null";
+            if (auto n = store.ttl_evictions()) evictions = std::to_string(*n);
+            respond(fd, 200,
+                "{\"backend\":" + escape_json(store.backend_name()) +
+                ",\"resident_sessions\":" + std::to_string(store.resident_count()) +
+                ",\"ttl_evictions\":" + evictions + "}");
+            return;
+        }
+
+        if (req.path == "/sessions" && req.method == "POST") {
+            std::map<std::string, std::string> fields;
+            try {
+                fields = JsonStringObjectParser(req.body).parse();
+            } catch (const std::exception&) {
+                respond(fd, 400, R"({"error":"invalid JSON object"})");
+                return;
+            }
             if (fields.size() != 2 || !fields.count("token") || !fields.count("state") ||
                 !valid_token(fields.at("token")) || fields.at("state").size() > 4096) {
                 respond(fd, 400, R"JSON({"error":"expected token (1-64 letters/numbers/_/-) and state (string up to 4096 bytes)"})JSON");
                 return;
             }
-            bool existed = engine.has_active_session(fields.at("token"));
-            engine.handle_stateless_event(fields.at("token"), fields.at("state"));
-            respond(fd, existed ? 200 : 201, "{\"token\":" + escape_json(fields.at("token")) +
-                   ",\"state\":" + escape_json(fields.at("state")) + "}");
-        } catch (const std::exception&) {
-            respond(fd, 400, R"({"error":"invalid JSON object"})");
+            const bool existed = store.exists(fields.at("token"));
+            store.put(fields.at("token"), fields.at("state"));
+            respond(fd, existed ? 200 : 201,
+                    "{\"token\":" + escape_json(fields.at("token")) +
+                    ",\"state\":" + escape_json(fields.at("state")) + "}");
+            return;
         }
-        return;
-    }
-    if (req.path.rfind("/sessions/", 0) == 0 && (req.method == "GET" || req.method == "DELETE")) {
-        std::string token = req.path.substr(std::string("/sessions/").size());
-        if (!valid_token(token)) { respond(fd, 400, R"({"error":"invalid token"})"); return; }
-        if (req.method == "GET") {
-            auto state = engine.get_session(token);
-            if (!state) { respond(fd, 404, R"({"error":"session missing or expired"})"); return; }
-            respond(fd, 200, "{\"token\":" + escape_json(token) + ",\"state\":" + escape_json(*state) + "}");
+
+        if (req.path.rfind("/sessions/", 0) == 0 &&
+            (req.method == "GET" || req.method == "DELETE")) {
+            std::string token = req.path.substr(std::string("/sessions/").size());
+            if (!valid_token(token)) {
+                respond(fd, 400, R"({"error":"invalid token"})");
+                return;
+            }
+            if (req.method == "GET") {
+                auto state = store.get(token);
+                if (!state) {
+                    respond(fd, 404, R"({"error":"session missing or expired"})");
+                    return;
+                }
+                respond(fd, 200,
+                        "{\"token\":" + escape_json(token) +
+                        ",\"state\":" + escape_json(*state) + "}");
+            } else {
+                if (store.erase(token)) respond(fd, 204);
+                else respond(fd, 404, R"({"error":"session missing or expired"})");
+            }
+            return;
+        }
+
+        if (req.path == "/sessions" || req.path == "/health" || req.path == "/metrics" ||
+            req.path.rfind("/sessions/", 0) == 0) {
+            respond(fd, 405, R"({"error":"method not allowed"})");
         } else {
-            if (engine.delete_session(token)) respond(fd, 204);
-            else respond(fd, 404, R"({"error":"session missing or expired"})");
+            respond(fd, 404, R"({"error":"unknown endpoint"})");
         }
-        return;
+    } catch (const std::runtime_error& e) {
+        std::cerr << "Backend error: " << e.what() << '\n';
+        respond(fd, 503, R"({"error":"session backend unavailable"})");
+    } catch (const std::exception&) {
+        respond(fd, 400, R"({"error":"invalid JSON object"})");
     }
-    if (req.path == "/sessions" || req.path == "/health" || req.path == "/metrics" || req.path.rfind("/sessions/", 0) == 0)
-        respond(fd, 405, R"({"error":"method not allowed"})");
-    else respond(fd, 404, R"({"error":"unknown endpoint"})");
 }
 
 int parse_arg(const char* s, int minval, int maxval) {
@@ -295,53 +328,111 @@ int parse_arg(const char* s, int minval, int maxval) {
         std::string text(s);
         std::size_t pos = 0;
         long long n = std::stoll(text, &pos);
-        if (pos != text.size() || n < minval || n > maxval) throw std::invalid_argument("range");
+        if (pos != text.size() || n < minval || n > maxval)
+            throw std::invalid_argument("range");
         return static_cast<int>(n);
-    } catch (...) { throw std::invalid_argument("invalid numeric option"); }
+    } catch (...) {
+        throw std::invalid_argument("invalid numeric option");
+    }
 }
 } // namespace
 
 int main(int argc, char** argv) {
     int port = 8080;
     int ttl_ms = 300000;
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--port" && i + 1 < argc) port = parse_arg(argv[++i], 0, 65535);
-        else if (std::string(argv[i]) == "--ttl-ms" && i + 1 < argc) ttl_ms = parse_arg(argv[++i], 1, 3600000);
-        else { std::cerr << "Usage: teco_server [--port 0..65535] [--ttl-ms 1..3600000]\n"; return 2; }
-    }
-    std::signal(SIGPIPE, SIG_IGN);
-    int server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server < 0) { perror("socket"); return 1; }
-    int reuse = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 || listen(server, 16) != 0) {
-        perror("bind/listen"); close(server); return 1;
-    }
-    socklen_t size = sizeof(addr);
-    getsockname(server, reinterpret_cast<sockaddr*>(&addr), &size);
-    std::cout << "TECO listening on http://127.0.0.1:" << ntohs(addr.sin_port) << std::endl;
-    TECOCloudEngine engine{std::chrono::milliseconds(ttl_ms)};
-    for (;;) {
-        int client = accept(server, nullptr, nullptr);
-        if (client < 0) { if (errno == EINTR) continue; perror("accept"); break; }
-        timeval timeout{3, 0};
-        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
-        Request req;
-        int err = 400;
-        try {
-            if (read_request(client, req, err)) dispatch(client, engine, req);
-            else respond(client, err, "{\"error\":" + escape_json(message_for(err)) + "}");
-        } catch (const std::exception& e) {
-            std::cerr << "Request error: " << e.what() << '\n';
-            respond(client, 500, R"({"error":"internal error"})");
+    int redis_port = 6379;
+    std::string backend = "memory";
+    std::string redis_host = "127.0.0.1";
+    std::string redis_prefix = "teco:session:";
+
+    try {
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg == "--port" && i + 1 < argc) port = parse_arg(argv[++i], 0, 65535);
+            else if (arg == "--ttl-ms" && i + 1 < argc) ttl_ms = parse_arg(argv[++i], 1, 3600000);
+            else if (arg == "--backend" && i + 1 < argc) backend = argv[++i];
+            else if (arg == "--redis-host" && i + 1 < argc) redis_host = argv[++i];
+            else if (arg == "--redis-port" && i + 1 < argc) redis_port = parse_arg(argv[++i], 1, 65535);
+            else if (arg == "--redis-prefix" && i + 1 < argc) redis_prefix = argv[++i];
+            else {
+                std::cerr
+                    << "Usage: teco_server [--port 0..65535] [--ttl-ms 1..3600000] "
+                    << "[--backend memory|redis] [--redis-host HOST] [--redis-port PORT] "
+                    << "[--redis-prefix PREFIX]\n";
+                return 2;
+            }
         }
-        close(client);
+
+        if (backend != "memory" && backend != "redis") {
+            std::cerr << "--backend must be memory or redis\n";
+            return 2;
+        }
+
+        std::unique_ptr<SessionStore> store;
+        if (backend == "redis") {
+            store = std::make_unique<RedisSessionStore>(
+                redis_host, redis_port, ttl_ms, redis_prefix);
+        } else {
+            store = std::make_unique<InMemorySessionStore>(
+                std::chrono::milliseconds(ttl_ms));
+        }
+
+        std::signal(SIGPIPE, SIG_IGN);
+        int server = socket(AF_INET, SOCK_STREAM, 0);
+        if (server < 0) {
+            perror("socket");
+            return 1;
+        }
+
+        int reuse = 1;
+        setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+
+        if (bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+            listen(server, 16) != 0) {
+            perror("bind/listen");
+            close(server);
+            return 1;
+        }
+
+        socklen_t size = sizeof(addr);
+        getsockname(server, reinterpret_cast<sockaddr*>(&addr), &size);
+        std::cout << "TECO listening on http://127.0.0.1:" << ntohs(addr.sin_port)
+                  << " backend=" << store->backend_name() << std::endl;
+
+        for (;;) {
+            int client = accept(server, nullptr, nullptr);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                perror("accept");
+                break;
+            }
+
+            timeval timeout{3, 0};
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+            Request req;
+            int err = 400;
+            try {
+                if (read_request(client, req, err)) dispatch(client, *store, req);
+                else respond(client, err, "{\"error\":" + escape_json(message_for(err)) + "}");
+            } catch (const std::exception& e) {
+                std::cerr << "Request error: " << e.what() << '\n';
+                respond(client, 500, R"({"error":"internal error"})");
+            }
+
+            close(client);
+        }
+
+        close(server);
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "TECO startup failed: " << e.what() << '\n';
+        return 1;
     }
-    close(server);
-    return 1;
 }

@@ -4,3 +4,7 @@ build/
 *.o
 teco
 teco_tests
+
+# Redis local data
+dump.rdb
+*.rdb
