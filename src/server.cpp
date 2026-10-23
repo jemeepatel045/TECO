@@ -2,11 +2,13 @@
 // Supports either the original in-memory session backend or a Redis-backed shared backend.
 // POSIX sockets: builds on macOS and Linux. NOT an internet-facing production server.
 #include "redis_store.hpp"
+#include "request_metrics.hpp"
 #include "session_store.hpp"
 
 #include <arpa/inet.h>
 #include <algorithm>
 #include <cstdint>
+#include <chrono>
 #include <cerrno>
 #include <csignal>
 #include <cctype>
@@ -24,6 +26,8 @@
 
 namespace {
 constexpr std::size_t MAX_REQUEST = 16384;
+RequestMetrics request_metrics;
+int last_response_status = 500;
 
 std::string escape_json(const std::string& s) {
     std::string out = "\"";
@@ -234,6 +238,7 @@ std::string message_for(int status) {
 }
 
 void respond(int fd, int status, std::string body = "{}") {
+    last_response_status = status;
     if (status == 204) body.clear();
     std::string out = "HTTP/1.1 " + std::to_string(status) + " " + message_for(status) + "\r\n"
        "Content-Type: application/json; charset=utf-8\r\n"
@@ -261,7 +266,8 @@ void dispatch(int fd, SessionStore& store, const Request& req) {
             respond(fd, 200,
                 "{\"backend\":" + escape_json(store.backend_name()) +
                 ",\"resident_sessions\":" + std::to_string(store.resident_count()) +
-                ",\"ttl_evictions\":" + evictions + "}");
+                ",\"ttl_evictions\":" + evictions +
+                request_metrics.json_fields() + "}");
             return;
         }
 
@@ -421,6 +427,8 @@ int main(int argc, char** argv) {
             setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
             setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+            const auto request_started = std::chrono::steady_clock::now();
+            last_response_status = 500;
             Request req;
             int err = 400;
             try {
@@ -430,6 +438,12 @@ int main(int argc, char** argv) {
                 std::cerr << "Request error: " << e.what() << '\n';
                 respond(client, 500, R"({"error":"internal error"})");
             }
+
+            const auto request_finished = std::chrono::steady_clock::now();
+            const double request_latency_ms =
+                std::chrono::duration<double, std::milli>(
+                    request_finished - request_started).count();
+            request_metrics.observe(last_response_status, request_latency_ms);
 
             close(client);
         }

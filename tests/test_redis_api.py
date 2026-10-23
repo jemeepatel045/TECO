@@ -106,6 +106,10 @@ def main(executable):
         assert metrics[1]["backend"] == "redis"
         assert metrics[1]["resident_sessions"] >= 1
         assert metrics[1]["ttl_evictions"] is None
+        assert metrics[1]["requests_total"] >= 1
+        assert metrics[1]["responses_2xx"] >= 1
+        assert metrics[1]["latency_samples"] >= 1
+        assert set(metrics[1]["latency_ms"]) == {"avg", "p50", "p95", "p99"}
 
         # Deletion on one process is immediately visible to the other.
         assert call(base_b, "DELETE", "/sessions/shared_user") == (204, None)
