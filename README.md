@@ -1,41 +1,103 @@
-# TECO: Thread-Less Ephemeral Context Orchestration
+# TECO
 
-TECO is a C++17 backend-systems portfolio project exploring event-driven, token-keyed ephemeral session state. It supports a local in-memory TTL engine and an optional Redis-backed mode that allows multiple TECO server processes to share session state.
+[![C++ CI](https://github.com/jemeepatel045/TECO/actions/workflows/ci.yml/badge.svg)](https://github.com/jemeepatel045/TECO/actions/workflows/ci.yml)
 
-## Current architecture
+**Thread-Less Ephemeral Context Orchestration** is a C++17 backend-systems project for short-lived, token-keyed session state.
 
-```text
-Client
-  |
-  v
-TECO REST API
-  |
-  +-------------------+
-  |                   |
-In-memory          Redis
-backend            backend
-  |                   |
-per-process        shared session state
-sliding TTL        Redis PX TTL
+TECO started as a small TTL engine and evolved into a complete local systems prototype with a REST API, interchangeable in-memory and Redis storage, multi-instance Docker deployment, metrics, benchmarking, health semantics, graceful shutdown, and automated failure/recovery testing.
+
+> TECO is intentionally an educational systems prototype, not an internet-facing production HTTP server.
+
+## What TECO demonstrates
+
+- C++17 systems programming with POSIX sockets
+- A small HTTP/1.1 server with bounded request parsing
+- Token-keyed ephemeral session state with TTL behavior
+- Storage abstraction with in-memory and Redis backends
+- Shared state across multiple TECO processes through Redis
+- Docker Compose deployment with two API instances and one Redis service
+- Liveness and dependency-aware readiness probes
+- Graceful `SIGINT` / `SIGTERM` shutdown
+- Process-local request metrics and latency percentiles
+- Repeatable local load testing
+- Redis outage and recovery validation
+- CMake, CTest, Python integration tests, and GitHub Actions CI
+
+## Architecture
+
+```mermaid
+flowchart LR
+    C[Client] --> A[TECO API A]
+    C --> B[TECO API B]
+
+    A --> S{SessionStore}
+    B --> S
+
+    S --> M[In-memory TTL engine]
+    S --> R[(Redis)]
+
+    A --> O[Process-local metrics]
+    B --> O
+
+    H[/livez + /readyz] --> A
+    H --> B
 ```
 
-## Features
+The server is single-threaded and handles one accepted connection at a time. The storage interface lets the HTTP layer use either the in-memory TTL engine or Redis without changing the API surface.
 
-- Token-keyed session state
-- Sliding TTL refreshed on writes
-- In-memory backend with lazy lookup eviction and periodic sweeps
-- Redis backend using Redis TTL (`SET ... PX`)
-- Cross-process session sharing through Redis
-- REST endpoints for create/update, read, delete, health, and metrics
-- CMake build and CTest suite
-- Python HTTP integration tests
-- Redis cross-instance integration test
-- GitHub Actions CI with a Redis service container
-- Illustrative local benchmark against sequential OS thread create/join
+For a deeper walkthrough, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Build
+## Quick start with Docker
 
-Requires C++17, CMake 3.16+, and Python 3.8+.
+Requirements:
+
+- Docker Desktop
+- Docker Compose
+
+Start the complete Redis-backed deployment:
+
+```sh
+docker compose up --build -d
+docker compose ps
+```
+
+Verify both TECO instances:
+
+```sh
+curl -fsS http://127.0.0.1:8080/readyz
+curl -fsS http://127.0.0.1:8081/readyz
+```
+
+Create a session through instance A:
+
+```sh
+curl -i -X POST http://127.0.0.1:8080/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"demo_1","state":"ACTIVE"}'
+```
+
+Read the same session through instance B:
+
+```sh
+curl -i http://127.0.0.1:8081/sessions/demo_1
+```
+
+Stop the stack:
+
+```sh
+docker compose down
+```
+
+See [docs/DEMO.md](docs/DEMO.md) for a short portfolio demonstration.
+
+## Build from source
+
+Requirements:
+
+- C++17 compiler
+- CMake 3.16+
+- Python 3.8+
+- Redis for Redis integration tests
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -43,24 +105,17 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-When Redis is not available, the Redis integration test is skipped. On GitHub Actions, CI launches Redis automatically.
+If Redis is unavailable, the Redis integration test exits with CTest's configured skip code. GitHub Actions provides Redis automatically for CI.
 
-## In-memory server
+## Run locally
+
+In-memory backend:
 
 ```sh
 ./build/teco_server --port 8080 --backend memory --ttl-ms 300000
 ```
 
-## Redis-backed server
-
-Start a local Redis service first:
-
-```sh
-brew services start redis
-redis-cli ping
-```
-
-Then:
+Redis backend:
 
 ```sh
 ./build/teco_server \
@@ -71,113 +126,208 @@ Then:
   --ttl-ms 300000
 ```
 
-Start a second instance in another terminal:
+Configuration can also come from environment variables:
 
-```sh
-./build/teco_server \
-  --port 8081 \
-  --backend redis \
-  --redis-host 127.0.0.1 \
-  --redis-port 6379 \
-  --ttl-ms 300000
-```
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `TECO_PORT` | HTTP port | `8080` |
+| `TECO_TTL_MS` | Session TTL in milliseconds | `300000` |
+| `TECO_BACKEND` | `memory` or `redis` | `memory` |
+| `TECO_REDIS_HOST` | Redis hostname | `127.0.0.1` |
+| `TECO_REDIS_PORT` | Redis port | `6379` |
+| `TECO_REDIS_PREFIX` | Redis key prefix | `teco:session:` |
+| `TECO_BIND_ALL` | Bind all interfaces when set to `1` | loopback only |
+| `TECO_LOG_JSON` | Emit JSON request logs when set to `1` | disabled |
 
-A session written to port 8080 can then be read from port 8081 because both processes use the same Redis backend.
+Explicit command-line flags override environment defaults.
 
 ## API
 
-```sh
-curl -i http://127.0.0.1:8080/health
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/sessions` | Create or update a session |
+| `GET` | `/sessions/{token}` | Read an active session |
+| `DELETE` | `/sessions/{token}` | Delete a session |
+| `GET` | `/health` | Compatibility health endpoint |
+| `GET` | `/livez` | Process liveness |
+| `GET` | `/readyz` | Backend-aware readiness |
+| `GET` | `/metrics` | Process-local telemetry |
 
+Example request:
+
+```sh
 curl -i -X POST http://127.0.0.1:8080/sessions \
   -H 'Content-Type: application/json' \
-  -d '{"token":"demo_1","state":"ACTIVE"}'
-
-curl -i http://127.0.0.1:8081/sessions/demo_1
-
-curl -i http://127.0.0.1:8080/metrics
-
-curl -i -X DELETE http://127.0.0.1:8081/sessions/demo_1
+  -d '{"token":"alice","state":"ACTIVE"}'
 ```
 
-## Metrics behavior
+## Health and failure behavior
 
-The in-memory backend reports TECO-observed TTL evictions. Redis performs expiration internally, so `ttl_evictions` is `null` in Redis mode until a future phase adds Redis keyspace-notification telemetry.
+`/livez` only checks that the TECO HTTP process can respond.
 
-The Redis prototype uses `KEYS` to count TECO-prefixed sessions for a small local demonstration. A production implementation should use a scalable metrics strategy instead of `KEYS`.
+`/readyz` checks whether the configured backend can serve traffic. In Redis mode it performs a Redis `PING`:
 
-## Scope and limitations
+- Redis available: `200 {"status":"ready"}`
+- Redis unavailable: `503 {"status":"not_ready","backend":"redis"}`
+- `/livez` remains `200` during the Redis outage
 
-TECO is currently an educational local prototype, not a production internet-facing service.
+The Docker image health check uses `/readyz`, so container health reflects dependency readiness.
 
-The HTTP server is intentionally single-threaded and loopback-only. The included Redis client is a small RESP client created for this project and opens a Redis TCP connection per command. It does not implement authentication, TLS, connection pooling, Redis Cluster, Sentinel, retries, or production-grade observability.
+TECO converts Redis runtime failures into HTTP `503` responses instead of terminating the process.
 
-The original benchmark compares the TECO event loop against sequential OS thread creation and joining. It is not a reusable thread-pool comparison and does not prove serverless or distributed performance superiority.
+## Observability
 
-## Docker Compose demo (Phase 4)
+`GET /metrics` exposes process-local telemetry including:
 
-Requires Docker Desktop with Docker Compose.
+- total requests
+- 2xx, 4xx, and 5xx response counts
+- process uptime
+- process-average request rate
+- bounded recent latency samples
+- average latency
+- P50, P95, and P99 latency
+- resident session count
+- in-memory TTL eviction count
+
+Redis expiration is performed by Redis itself, so Redis `ttl_evictions` is reported as `null`.
+
+Optional structured request logging:
 
 ```sh
-docker compose up --build -d
-docker compose ps
-curl -fsS http://127.0.0.1:8080/health
-curl -fsS http://127.0.0.1:8081/health
-curl -i -X POST http://127.0.0.1:8080/sessions -H 'Content-Type: application/json' -d '{"token":"docker_demo","state":"FROM_A"}'
-curl -i http://127.0.0.1:8081/sessions/docker_demo
-docker compose down
+TECO_LOG_JSON=1 ./build/teco_server --port 8080
 ```
 
-Both API containers use one shared Redis service. Published ports are restricted to host loopback, and Redis is not exposed to the host. `TECO_BIND_ALL=1` enables container network access without changing the default host-only behavior. Redis persistence is intentionally disabled for this ephemeral demo. The HTTP implementation remains an educational prototype, not a hardened production service.
+## Benchmark snapshot
 
+The repository includes a repeatable local session-read benchmark.
 
-## Observability and benchmarking (Phase 5)
+Captured local result using 1,000 requests, concurrency 8, and 25 warmup requests:
 
-TECO now records process-local request telemetry. The `/metrics` endpoint includes total requests, response-class counters, process uptime, process-average request rate, and a bounded recent latency window with average, P50, P95, and P99 latency.
+| Backend | Throughput | Avg latency | P50 | P95 | P99 | Errors |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| In-memory | 5952.92 req/s | 1.312 ms | 1.258 ms | 1.816 ms | 2.469 ms | 0 |
+| Redis | 2535.68 req/s | 3.114 ms | 2.988 ms | 3.958 ms | 6.118 ms | 0 |
 
-For controlled client-observed measurements:
+These are machine-specific local measurements, not universal performance claims. The in-memory run is native while the Redis comparison uses the Docker deployment, so the result is useful as a project snapshot rather than a strict backend microbenchmark.
 
-```sh
-python3 benchmarks/load_test.py --url http://127.0.0.1:8080 --requests 1000 --concurrency 8 --mode session-read
-```
-
-Compare in-memory and Redis backends with:
+Run it yourself:
 
 ```sh
 ./benchmarks/run_comparison.sh
 ```
 
-See [BENCHMARKS.md](BENCHMARKS.md) for methodology. TECO remains intentionally single-threaded, and results are machine-dependent.
+See [BENCHMARKS.md](BENCHMARKS.md) for methodology and `benchmarks/latest_results.txt` for the captured output.
 
+## Resilience test
 
-## Reliability (Phase 6)
-
-- `GET /livez` checks whether the HTTP process can respond (no Redis dependency).
-- `GET /readyz` checks Redis `PING` when using the Redis backend and returns HTTP 503 if Redis is unavailable.
-- `SIGTERM` and `SIGINT` request graceful shutdown after the current request; idle accept polling is at most about one second.
-- Optional JSON request logs: `TECO_LOG_JSON=1` (avoid logging request bodies or tokens in sensitive deployments; URLs are logged).
-- Environment defaults: `TECO_PORT`, `TECO_TTL_MS`, `TECO_BACKEND`, `TECO_REDIS_HOST`, `TECO_REDIS_PORT`, `TECO_REDIS_PREFIX`. Explicit command-line flags override environment values.
-
-Example:
-
-```sh
-TECO_PORT=8090 TECO_BACKEND=memory TECO_LOG_JSON=1 ./build/teco_server
-curl -i http://127.0.0.1:8090/readyz
-```
-
-This remains a local demonstration server, not an internet-facing production HTTP implementation.
-
-
-## Resilience testing (Phase 7)
-
-TECO includes an end-to-end Docker failure/recovery test:
+Run the end-to-end Docker failure/recovery scenario:
 
 ```sh
 python3 tests/test_docker_resilience.py
 ```
 
-The test verifies cross-instance Redis state, Redis outage behavior, `/livez` versus `/readyz`, HTTP 503 backend-failure handling, recovery after Redis restart, and clean SIGTERM shutdown. GitHub Actions runs the same scenario in a dedicated `docker-resilience` job.
+It validates:
 
-The Docker image health check now targets `/readyz`, so container health reflects backend readiness rather than only HTTP-process liveness.
+1. both TECO instances become ready
+2. cross-instance session sharing works
+3. Redis is stopped
+4. `/readyz` changes to `503`
+5. `/livez` remains `200`
+6. Redis-dependent session traffic returns `503`
+7. Redis is restarted
+8. both TECO instances recover
+9. cross-instance traffic works again
+10. a TECO container exits cleanly after `SIGTERM`
 
-See [RESILIENCE.md](RESILIENCE.md) for the exact validation sequence and scope.
+See [RESILIENCE.md](RESILIENCE.md).
+
+## Release verification
+
+Before tagging a release:
+
+```sh
+./scripts/release_check.sh
+```
+
+This performs a Release build, runs the CTest suite, and executes the Docker resilience scenario.
+
+## Project structure
+
+```text
+TECO/
+├── .github/workflows/ci.yml
+├── benchmarks/
+│   ├── latest_results.txt
+│   ├── load_test.py
+│   └── run_comparison.sh
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── DEMO.md
+├── include/
+│   ├── redis_store.hpp
+│   ├── request_metrics.hpp
+│   ├── session_store.hpp
+│   └── teco_engine.hpp
+├── scripts/
+│   └── release_check.sh
+├── src/
+│   ├── main.cpp
+│   └── server.cpp
+├── tests/
+│   ├── test_api.py
+│   ├── test_docker_resilience.py
+│   ├── test_engine.cpp
+│   └── test_redis_api.py
+├── BENCHMARKS.md
+├── CHANGELOG.md
+├── CMakeLists.txt
+├── Dockerfile
+├── LICENSE
+├── README.md
+├── RELEASE_NOTES_v1.0.0.md
+├── RESILIENCE.md
+└── compose.yaml
+```
+
+## Design decisions
+
+**Single-threaded HTTP loop.** TECO intentionally keeps the server model simple so the project can focus on lifecycle, state, storage, metrics, and failure semantics.
+
+**Storage abstraction.** `SessionStore` isolates API behavior from backend implementation.
+
+**Redis TTL ownership.** Redis-backed sessions use Redis expiration rather than duplicating timer logic in each TECO process.
+
+**Liveness vs readiness.** A running process can remain alive while its backend is unavailable. TECO exposes that distinction directly.
+
+**No blind Redis retries.** A failed network operation can have an uncertain outcome. The prototype surfaces failure instead of automatically replaying commands whose effects may be ambiguous.
+
+## Current limitations
+
+TECO v1.0 is a portfolio systems prototype. It intentionally does not implement:
+
+- TLS
+- authentication or authorization
+- a production HTTP parser
+- persistent HTTP connections
+- a thread pool or multi-core request execution
+- Redis authentication or TLS
+- Redis connection pooling
+- Redis Cluster or Sentinel
+- automatic Redis failover
+- distributed metrics aggregation
+- production rate limiting
+
+The Redis metrics path also uses `KEYS` to count TECO-prefixed sessions, which is acceptable for this small local demo but not appropriate for a large production keyspace.
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Demo walkthrough](docs/DEMO.md)
+- [Benchmark methodology](BENCHMARKS.md)
+- [Resilience validation](RESILIENCE.md)
+- [Changelog](CHANGELOG.md)
+- [v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md)
+
+## License
+
+See [LICENSE](LICENSE).
