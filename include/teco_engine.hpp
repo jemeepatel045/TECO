@@ -1,6 +1,7 @@
 #pragma once
 #include <chrono>
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -65,6 +66,23 @@ public:
             return false;
         }
         return true;
+    }
+
+    std::optional<std::string> get_session(const std::string& token) {
+        auto it = mesh_.find(token);
+        if (it == mesh_.end()) return std::nullopt;
+        if (Clock::now() - it->second.last_activity >= ttl_) {
+            mesh_.erase(it);
+            ++evictions_;
+            return std::nullopt;
+        }
+        return it->second.state; // Reads do not extend the sliding TTL.
+    }
+
+    bool delete_session(const std::string& token) {
+        // An expired session is considered missing and counts as a TTL eviction.
+        if (!has_active_session(token)) return false;
+        return mesh_.erase(token) != 0;
     }
 
     std::size_t resident_session_count() const { return mesh_.size(); }
