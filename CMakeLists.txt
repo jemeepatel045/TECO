@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.16)
+project(TECO VERSION 0.1.0 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_library(teco_engine INTERFACE)
+target_include_directories(teco_engine INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_executable(teco src/main.cpp)
+target_link_libraries(teco PRIVATE teco_engine)
+add_executable(teco_tests tests/test_engine.cpp)
+target_link_libraries(teco_tests PRIVATE teco_engine)
+enable_testing()
+add_test(NAME teco_tests COMMAND teco_tests)
+
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(teco_tests PRIVATE -UNDEBUG)
+endif()
