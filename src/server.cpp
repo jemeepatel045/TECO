@@ -26,6 +26,9 @@
 
 namespace {
 constexpr std::size_t MAX_REQUEST = 16384;
+// TECO Phase 6 reliability
+volatile std::sig_atomic_t shutdown_requested = 0;
+void request_shutdown(int) { shutdown_requested = 1; }
 RequestMetrics request_metrics;
 int last_response_status = 500;
 
@@ -255,6 +258,19 @@ void respond(int fd, int status, std::string body = "{}") {
 
 void dispatch(int fd, SessionStore& store, const Request& req) {
     try {
+        if (req.path == "/livez" && req.method == "GET") {
+            respond(fd, 200, R"({"status":"alive"})");
+            return;
+        }
+        if (req.path == "/readyz" && req.method == "GET") {
+            auto* redis = dynamic_cast<RedisSessionStore*>(&store);
+            if (redis && !redis->ping()) {
+                respond(fd, 503, R"({"status":"not_ready","backend":"redis"})");
+            } else {
+                respond(fd, 200, R"({"status":"ready"})");
+            }
+            return;
+        }
         if (req.path == "/health" && req.method == "GET") {
             respond(fd, 200, R"({"status":"ok","service":"TECO"})");
             return;
@@ -315,7 +331,7 @@ void dispatch(int fd, SessionStore& store, const Request& req) {
             return;
         }
 
-        if (req.path == "/sessions" || req.path == "/health" || req.path == "/metrics" ||
+        if (req.path == "/sessions" || req.path == "/health" || req.path == "/livez" || req.path == "/readyz" || req.path == "/metrics" ||
             req.path.rfind("/sessions/", 0) == 0) {
             respond(fd, 405, R"({"error":"method not allowed"})");
         } else {
@@ -344,14 +360,26 @@ int parse_arg(const char* s, int minval, int maxval) {
 } // namespace
 
 int main(int argc, char** argv) {
+    auto env = [](const char* name, const std::string& fallback) -> std::string {
+        const char* value = std::getenv(name);
+        return value ? std::string(value) : fallback;
+    };
     int port = 8080;
     int ttl_ms = 300000;
     int redis_port = 6379;
     std::string backend = "memory";
     std::string redis_host = "127.0.0.1";
     std::string redis_prefix = "teco:session:";
+    bool json_logs = false;
 
     try {
+        port = parse_arg(env("TECO_PORT", "8080").c_str(), 0, 65535);
+        ttl_ms = parse_arg(env("TECO_TTL_MS", "300000").c_str(), 1, 3600000);
+        redis_port = parse_arg(env("TECO_REDIS_PORT", "6379").c_str(), 1, 65535);
+        backend = env("TECO_BACKEND", "memory");
+        redis_host = env("TECO_REDIS_HOST", "127.0.0.1");
+        redis_prefix = env("TECO_REDIS_PREFIX", "teco:session:");
+        json_logs = env("TECO_LOG_JSON", "0") == "1";
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--port" && i + 1 < argc) port = parse_arg(argv[++i], 0, 65535);
@@ -384,6 +412,11 @@ int main(int argc, char** argv) {
         }
 
         std::signal(SIGPIPE, SIG_IGN);
+        struct sigaction action{};
+        action.sa_handler = request_shutdown;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGTERM, &action, nullptr);
+        sigaction(SIGINT, &action, nullptr);
         int server = socket(AF_INET, SOCK_STREAM, 0);
         if (server < 0) {
             perror("socket");
@@ -410,15 +443,18 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Poll accept once per second so shutdown works even when idle.
+        timeval accept_timeout{1, 0};
+        setsockopt(server, SOL_SOCKET, SO_RCVTIMEO, &accept_timeout, sizeof(accept_timeout));
         socklen_t size = sizeof(addr);
         getsockname(server, reinterpret_cast<sockaddr*>(&addr), &size);
         std::cout << "TECO listening on http://127.0.0.1:" << ntohs(addr.sin_port)
                   << " backend=" << store->backend_name() << std::endl;
 
-        for (;;) {
+        while (!shutdown_requested) {
             int client = accept(server, nullptr, nullptr);
             if (client < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 perror("accept");
                 break;
             }
@@ -444,12 +480,20 @@ int main(int argc, char** argv) {
                 std::chrono::duration<double, std::milli>(
                     request_finished - request_started).count();
             request_metrics.observe(last_response_status, request_latency_ms);
+            if (json_logs) {
+                std::cout << "{\"event\":\"http_request\",\"method\":"
+                          << escape_json(req.method) << ",\"path\":"
+                          << escape_json(req.path) << ",\"status\":"
+                          << last_response_status << ",\"latency_ms\":"
+                          << request_latency_ms << "}" << std::endl;
+            }
 
             close(client);
         }
 
         close(server);
-        return 1;
+        std::cout << "TECO stopped" << std::endl;
+        return shutdown_requested ? 0 : 1;
     } catch (const std::exception& e) {
         std::cerr << "TECO startup failed: " << e.what() << '\n';
         return 1;
